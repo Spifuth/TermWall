@@ -1,0 +1,13 @@
+# ShellCheck configuration for termwall
+# https://www.shellcheck.net/wiki/
+
+# Disable some checks that are intentional in this project
+
+# SC2034: Unused variables (some are used dynamically)
+disable=SC2034
+
+# SC1090: Can't follow non-constant source (we don't source external files)
+disable=SC1090
+
+# SC2155: Declare and assign separately (preference)
+# We handle errors explicitly where needed

@@ -1,0 +1,999 @@
+#!/usr/bin/env bash
+#
+# termwall — Terminal idle animation / screensaver
+# A Bash screensaver that displays animations after idle time
+#
+# Usage: termwall <command> [options]
+# Commands: run, watch, list-modes, validate-config
+#
+
+set -euo pipefail
+
+# ==============================================================================
+# Constants & Defaults
+# ==============================================================================
+
+readonly VERSION="1.0.0"
+readonly PROGRAM_NAME="termwall"
+readonly DEFAULT_CONFIG_PATH="${HOME}/.config/termwall/config"
+
+# Default configuration values
+DEFAULT_MODE="stars"
+DEFAULT_FPS="60"
+DEFAULT_IDLE_SECONDS="300"
+DEFAULT_DURATION_SECONDS="0"
+DEFAULT_COLOR_THEME="green"
+DEFAULT_MESSAGE=""
+
+# Available modes
+readonly AVAILABLE_MODES=("stars" "bounce" "matrix")
+
+# Color themes (ANSI codes)
+declare -A COLOR_THEMES=(
+    [green]="\033[32m"
+    [cyan]="\033[36m"
+    [magenta]="\033[35m"
+    [mono]="\033[37m"
+)
+
+# ==============================================================================
+# Global State
+# ==============================================================================
+
+# Configuration (will be loaded from file or defaults)
+CONFIG_MODE="$DEFAULT_MODE"
+CONFIG_FPS="$DEFAULT_FPS"
+CONFIG_IDLE_SECONDS="$DEFAULT_IDLE_SECONDS"
+CONFIG_DURATION_SECONDS="$DEFAULT_DURATION_SECONDS"
+CONFIG_COLOR_THEME="$DEFAULT_COLOR_THEME"
+CONFIG_MESSAGE="$DEFAULT_MESSAGE"
+
+# Terminal state
+TERM_COLS=80
+TERM_LINES=24
+ORIGINAL_STTY=""
+RUNNING=true
+IN_ALT_BUFFER=false
+
+# ==============================================================================
+# Utility Functions
+# ==============================================================================
+
+# Print error message to stderr
+err() {
+    echo -e "\033[31mError:\033[0m $*" >&2
+}
+
+# Print warning message to stderr
+warn() {
+    echo -e "\033[33mWarning:\033[0m $*" >&2
+}
+
+# Print info message
+info() {
+    echo -e "\033[34mInfo:\033[0m $*"
+}
+
+# Check if running in interactive terminal
+check_interactive() {
+    # Refuse to run in VS Code integrated terminal (causes issues)
+    if [[ -n "${VSCODE_INJECTION:-}" ]] || [[ -n "${VSCODE_GIT_IPC_HANDLE:-}" ]] || [[ "${TERM_PROGRAM:-}" == "vscode" ]]; then
+        err "termwall does not work in VS Code integrated terminal"
+        err "Please run in a real terminal (gnome-terminal, konsole, alacritty, etc.)"
+        exit 1
+    fi
+    
+    # Check if stdin and stdout are TTYs
+    if [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+        err "termwall requires an interactive terminal"
+        exit 1
+    fi
+}
+
+# Update terminal dimensions
+update_term_size() {
+    TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+    TERM_LINES=$(tput lines 2>/dev/null || echo 24)
+}
+
+# ==============================================================================
+# Terminal Control Functions
+# ==============================================================================
+
+# Save terminal state and switch to alternate buffer
+enter_alt_buffer() {
+    # Save current stty settings
+    ORIGINAL_STTY=$(stty -g 2>/dev/null || true)
+    
+    # Switch to alternate screen buffer
+    printf '\033[?1049h'
+    IN_ALT_BUFFER=true
+    
+    # Hide cursor
+    printf '\033[?25l'
+    
+    # Disable echo and canonical mode for immediate key detection
+    stty -echo -icanon min 1 time 0 2>/dev/null || true
+    
+    # Clear screen
+    printf '\033[2J\033[H'
+}
+
+# Restore terminal to original state
+exit_alt_buffer() {
+    # Show cursor
+    printf '\033[?25h'
+    
+    # Reset colors
+    printf '\033[0m'
+    
+    # Switch back from alternate buffer
+    if [[ "$IN_ALT_BUFFER" == true ]]; then
+        printf '\033[?1049l'
+        IN_ALT_BUFFER=false
+    fi
+    
+    # Restore stty settings
+    if [[ -n "$ORIGINAL_STTY" ]]; then
+        stty "$ORIGINAL_STTY" 2>/dev/null || true
+    else
+        stty sane 2>/dev/null || true
+    fi
+}
+
+# Frame buffer for smooth rendering
+FRAME_BUFFER=""
+
+# Start building a frame
+begin_frame() {
+    FRAME_BUFFER=""
+}
+
+# Add to frame buffer
+buffer_print() {
+    FRAME_BUFFER+="$*"
+}
+
+# Flush frame buffer to terminal (single write = no flicker)
+end_frame() {
+    printf '%b' "$FRAME_BUFFER"
+}
+
+# Output to terminal (immediate)
+tty_print() {
+    printf '%b' "$@"
+}
+
+# Buffer: move cursor to position (1-indexed)
+buffer_move() {
+    local row=$1 col=$2
+    buffer_print "\033[${row};${col}H"
+}
+
+# Move cursor to position (1-indexed)
+move_cursor() {
+    local row=$1 col=$2
+    tty_print "\033[${row};${col}H"
+}
+
+# Clear current line
+clear_line() {
+    tty_print '\033[2K'
+}
+
+# Set foreground color from theme
+set_theme_color() {
+    local theme="${1:-$CONFIG_COLOR_THEME}"
+    tty_print "${COLOR_THEMES[$theme]:-${COLOR_THEMES[green]}}"
+}
+
+# Reset colors
+reset_color() {
+    tty_print '\033[0m'
+}
+
+# ==============================================================================
+# Configuration Functions
+# ==============================================================================
+
+# Parse configuration file
+parse_config() {
+    local config_file="$1"
+    
+    if [[ ! -f "$config_file" ]]; then
+        return 0  # Use defaults if no config file
+    fi
+    
+    local line_num=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_num++)) || true
+        
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        
+        # Remove inline comments and trim whitespace
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        
+        [[ -z "$line" ]] && continue
+        
+        # Parse key=value (with optional spaces around =)
+        if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            
+            # Trim whitespace from value
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            
+            # Remove quotes from value
+            value="${value#\"}"
+            value="${value%\"}"
+            value="${value#\'}"
+            value="${value%\'}"
+            
+            case "$key" in
+                mode)           CONFIG_MODE="$value" ;;
+                fps)            CONFIG_FPS="$value" ;;
+                idle_seconds)   CONFIG_IDLE_SECONDS="$value" ;;
+                duration_seconds) CONFIG_DURATION_SECONDS="$value" ;;
+                color_theme)    CONFIG_COLOR_THEME="$value" ;;
+                message)        CONFIG_MESSAGE="$value" ;;
+                *)              warn "Unknown config key '$key' at line $line_num" ;;
+            esac
+        else
+            warn "Invalid config syntax at line $line_num: $line"
+        fi
+    done < "$config_file"
+}
+
+# Validate configuration values
+validate_config() {
+    local errors=0
+    
+    # Validate mode
+    local valid_mode=false
+    for m in "${AVAILABLE_MODES[@]}"; do
+        [[ "$CONFIG_MODE" == "$m" ]] && valid_mode=true && break
+    done
+    if [[ "$valid_mode" != true ]]; then
+        err "Invalid mode '$CONFIG_MODE'. Available: ${AVAILABLE_MODES[*]}"
+        ((errors++)) || true
+    fi
+    
+    # Validate fps (1-60)
+    if ! [[ "$CONFIG_FPS" =~ ^[0-9]+$ ]] || ((CONFIG_FPS < 1 || CONFIG_FPS > 60)); then
+        err "Invalid fps '$CONFIG_FPS'. Must be 1-60"
+        ((errors++)) || true
+    fi
+    
+    # Validate idle_seconds (>= 0)
+    if ! [[ "$CONFIG_IDLE_SECONDS" =~ ^[0-9]+$ ]]; then
+        err "Invalid idle_seconds '$CONFIG_IDLE_SECONDS'. Must be non-negative integer"
+        ((errors++)) || true
+    fi
+    
+    # Validate duration_seconds (>= 0)
+    if ! [[ "$CONFIG_DURATION_SECONDS" =~ ^[0-9]+$ ]]; then
+        err "Invalid duration_seconds '$CONFIG_DURATION_SECONDS'. Must be non-negative integer"
+        ((errors++)) || true
+    fi
+    
+    # Validate color_theme
+    if [[ ! -v "COLOR_THEMES[$CONFIG_COLOR_THEME]" ]]; then
+        err "Invalid color_theme '$CONFIG_COLOR_THEME'. Available: ${!COLOR_THEMES[*]}"
+        ((errors++)) || true
+    fi
+    
+    return "$errors"
+}
+
+# Display current configuration
+show_config() {
+    echo "Current configuration:"
+    echo "  mode            = $CONFIG_MODE"
+    echo "  fps             = $CONFIG_FPS"
+    echo "  idle_seconds    = $CONFIG_IDLE_SECONDS"
+    echo "  duration_seconds = $CONFIG_DURATION_SECONDS"
+    echo "  color_theme     = $CONFIG_COLOR_THEME"
+    echo "  message         = $CONFIG_MESSAGE"
+}
+
+# ==============================================================================
+# Input Detection
+# ==============================================================================
+
+# Check if a key has been pressed (non-blocking)
+key_pressed() {
+    local char=""
+    if read -r -s -t 0.001 -n 1 char 2>/dev/null; then
+        # Ignore empty reads (can happen on some terminals)
+        [[ -n "$char" ]] && return 0
+    fi
+    return 1
+}
+
+# Flush any pending input
+flush_input() {
+    local dummy=""
+    # Read and discard all pending input
+    while read -r -s -t 0.01 -n 1 dummy 2>/dev/null; do :; done
+    # Additional flush via stty
+    stty -ixon 2>/dev/null || true
+}
+
+# ==============================================================================
+# Animation: Stars
+# ==============================================================================
+
+# Star field data
+declare -a STAR_X STAR_Y STAR_CHAR STAR_SPEED STAR_PREV_X STAR_PREV_Y
+
+init_stars() {
+    local num_stars=$(( (TERM_COLS * TERM_LINES) / 30 ))
+    ((num_stars < 30)) && num_stars=30
+    ((num_stars > 300)) && num_stars=300
+    
+    local star_chars=("." "·" "*" "+" "✦" "✧" "★" "☆")
+    
+    STAR_X=()
+    STAR_Y=()
+    STAR_CHAR=()
+    STAR_SPEED=()
+    STAR_PREV_X=()
+    STAR_PREV_Y=()
+    
+    for ((i = 0; i < num_stars; i++)); do
+        STAR_X+=($((RANDOM % TERM_COLS + 1)))
+        STAR_Y+=($((RANDOM % TERM_LINES + 1)))
+        STAR_CHAR+=("${star_chars[$((RANDOM % ${#star_chars[@]}))]}")
+        STAR_SPEED+=($((RANDOM % 3 + 1)))
+        STAR_PREV_X+=("${STAR_X[$i]}")
+        STAR_PREV_Y+=("${STAR_Y[$i]}")
+    done
+    
+    # Initial clear
+    tty_print '\033[2J'
+}
+
+render_stars() {
+    local frame=$1
+    local color="${COLOR_THEMES[$CONFIG_COLOR_THEME]:-${COLOR_THEMES[green]}}"
+    
+    begin_frame
+    
+    # Hide cursor during rendering
+    buffer_print '\033[?25l'
+    
+    for ((i = 0; i < ${#STAR_X[@]}; i++)); do
+        # Erase previous position
+        buffer_move "${STAR_PREV_Y[i]}" "${STAR_PREV_X[i]}"
+        buffer_print " "
+        
+        # Save current as previous
+        STAR_PREV_X[i]=${STAR_X[i]}
+        STAR_PREV_Y[i]=${STAR_Y[i]}
+        
+        # Update position (horizontal scrolling)
+        STAR_X[i]=$((STAR_X[i] - STAR_SPEED[i]))
+        
+        # Wrap around
+        if ((STAR_X[i] < 1)); then
+            STAR_X[i]=$TERM_COLS
+            STAR_Y[i]=$((RANDOM % TERM_LINES + 1))
+            STAR_PREV_X[i]=${STAR_X[i]}
+            STAR_PREV_Y[i]=${STAR_Y[i]}
+        fi
+        
+        # Draw star with twinkle effect
+        if ((RANDOM % 10 > 0)); then
+            buffer_move "${STAR_Y[i]}" "${STAR_X[i]}"
+            # Vary brightness
+            if ((RANDOM % 5 == 0)); then
+                buffer_print "\033[1m${color}${STAR_CHAR[i]}\033[0m"
+            else
+                buffer_print "${color}${STAR_CHAR[i]}\033[0m"
+            fi
+        fi
+    done
+    
+    # Display message if set
+    if [[ -n "$CONFIG_MESSAGE" ]]; then
+        local msg_len=${#CONFIG_MESSAGE}
+        local msg_col=$(( (TERM_COLS - msg_len) / 2 ))
+        local msg_row=$(( TERM_LINES / 2 ))
+        ((msg_col < 1)) && msg_col=1
+        
+        buffer_move "$msg_row" "$msg_col"
+        buffer_print "\033[1;37m${CONFIG_MESSAGE}\033[0m"
+    fi
+    
+    end_frame
+}
+
+# ==============================================================================
+# Animation: Bounce
+# ==============================================================================
+
+BOUNCE_X=1
+BOUNCE_Y=1
+BOUNCE_DX=1
+BOUNCE_DY=1
+BOUNCE_TEXT=""
+BOUNCE_PREV_X=1
+BOUNCE_PREV_Y=1
+BOUNCE_COLOR_IDX=0
+
+init_bounce() {
+    BOUNCE_TEXT="${CONFIG_MESSAGE:-TERMWALL}"
+    local text_len=${#BOUNCE_TEXT}
+    local max_x=$((TERM_COLS - text_len - 2))
+    ((max_x < 1)) && max_x=1
+    local max_y=$((TERM_LINES - 2))
+    ((max_y < 1)) && max_y=1
+    
+    BOUNCE_X=$((RANDOM % max_x + 2))
+    BOUNCE_Y=$((RANDOM % max_y + 2))
+    BOUNCE_DX=$((RANDOM % 2 * 2 - 1))  # -1 or 1
+    BOUNCE_DY=$((RANDOM % 2 * 2 - 1))  # -1 or 1
+    BOUNCE_PREV_X=$BOUNCE_X
+    BOUNCE_PREV_Y=$BOUNCE_Y
+    BOUNCE_COLOR_IDX=0
+    
+    # Initial screen setup with border
+    tty_print '\033[2J'
+    local color="${COLOR_THEMES[$CONFIG_COLOR_THEME]:-${COLOR_THEMES[green]}}"
+    
+    # Draw border
+    tty_print "${color}"
+    # Top border
+    move_cursor 1 1
+    tty_print '╔'
+    for ((i = 2; i < TERM_COLS; i++)); do
+        tty_print '═'
+    done
+    tty_print '╗'
+    # Bottom border
+    move_cursor "$TERM_LINES" 1
+    tty_print '╚'
+    for ((i = 2; i < TERM_COLS; i++)); do
+        tty_print '═'
+    done
+    tty_print '╝'
+    # Side borders
+    for ((i = 2; i < TERM_LINES; i++)); do
+        move_cursor "$i" 1
+        tty_print '║'
+        move_cursor "$i" "$TERM_COLS"
+        tty_print '║'
+    done
+    tty_print '\033[0m'
+}
+
+render_bounce() {
+    local frame=$1
+    local text_len=${#BOUNCE_TEXT}
+    
+    begin_frame
+    buffer_print '\033[?25l'
+    
+    # Erase previous position
+    buffer_move "$BOUNCE_PREV_Y" "$BOUNCE_PREV_X"
+    for ((i = 0; i < text_len; i++)); do
+        buffer_print " "
+    done
+    
+    # Save current position
+    BOUNCE_PREV_X=$BOUNCE_X
+    BOUNCE_PREV_Y=$BOUNCE_Y
+    
+    # Update position
+    BOUNCE_X=$((BOUNCE_X + BOUNCE_DX))
+    BOUNCE_Y=$((BOUNCE_Y + BOUNCE_DY))
+    
+    # Bounce off walls (inside border)
+    if ((BOUNCE_X <= 2)) || ((BOUNCE_X + text_len >= TERM_COLS)); then
+        BOUNCE_DX=$((BOUNCE_DX * -1))
+        BOUNCE_X=$((BOUNCE_X + BOUNCE_DX))
+        ((BOUNCE_COLOR_IDX++)) || true
+    fi
+    
+    if ((BOUNCE_Y <= 2)) || ((BOUNCE_Y >= TERM_LINES - 1)); then
+        BOUNCE_DY=$((BOUNCE_DY * -1))
+        BOUNCE_Y=$((BOUNCE_Y + BOUNCE_DY))
+        ((BOUNCE_COLOR_IDX++)) || true
+    fi
+    
+    # Clamp position
+    ((BOUNCE_X < 2)) && BOUNCE_X=2
+    ((BOUNCE_Y < 2)) && BOUNCE_Y=2
+    ((BOUNCE_X + text_len > TERM_COLS - 1)) && BOUNCE_X=$((TERM_COLS - text_len - 1))
+    ((BOUNCE_Y > TERM_LINES - 1)) && BOUNCE_Y=$((TERM_LINES - 1))
+    
+    # Draw bouncing text with color cycling (changes on bounce)
+    local colors=("91" "92" "93" "94" "95" "96" "97")
+    local color_idx=$((BOUNCE_COLOR_IDX % ${#colors[@]}))
+    
+    buffer_move "$BOUNCE_Y" "$BOUNCE_X"
+    buffer_print "\033[1;${colors[$color_idx]}m${BOUNCE_TEXT}\033[0m"
+    
+    end_frame
+}
+
+# ==============================================================================
+# Animation: Matrix
+# ==============================================================================
+
+declare -a MATRIX_DROPS MATRIX_SPEEDS MATRIX_LENGTHS
+
+init_matrix() {
+    local num_drops=$((TERM_COLS / 2))
+    ((num_drops < 15)) && num_drops=15
+    ((num_drops > 150)) && num_drops=150
+    
+    MATRIX_DROPS=()
+    MATRIX_SPEEDS=()
+    MATRIX_LENGTHS=()
+    
+    for ((i = 0; i < num_drops; i++)); do
+        MATRIX_DROPS+=($((RANDOM % TERM_LINES * 2 - TERM_LINES)))  # Start some off-screen
+        MATRIX_SPEEDS+=($((RANDOM % 2 + 1)))
+        MATRIX_LENGTHS+=($((RANDOM % 15 + 8)))
+    done
+    
+    # Initial clear
+    tty_print '\033[2J\033[0;32m'
+}
+
+render_matrix() {
+    local frame=$1
+    
+    # Matrix characters (mix of katakana and latin)
+    local chars="ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇﾍ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    local chars_len=${#chars}
+    
+    begin_frame
+    buffer_print '\033[?25l'
+    
+    local drop_col=1
+    for ((i = 0; i < ${#MATRIX_DROPS[@]}; i++)); do
+        local prev_head=${MATRIX_DROPS[i]}
+        local length=${MATRIX_LENGTHS[i]}
+        
+        # Erase tail (the character that's fading out)
+        local tail_y=$((prev_head - length))
+        if ((tail_y >= 1 && tail_y <= TERM_LINES)); then
+            buffer_move "$tail_y" "$drop_col"
+            buffer_print " "
+        fi
+        
+        # Update drop position
+        MATRIX_DROPS[i]=$((MATRIX_DROPS[i] + MATRIX_SPEEDS[i]))
+        local head_y=${MATRIX_DROPS[i]}
+        
+        # Reset if completely off screen
+        if ((head_y - length > TERM_LINES)); then
+            MATRIX_DROPS[i]=$((-(RANDOM % 20)))
+            MATRIX_SPEEDS[i]=$((RANDOM % 2 + 1))
+            MATRIX_LENGTHS[i]=$((RANDOM % 15 + 8))
+        fi
+        
+        # Draw visible parts of the trail
+        for ((j = 0; j < length && j < TERM_LINES; j++)); do
+            local y=$((head_y - j))
+            if ((y >= 1 && y <= TERM_LINES)); then
+                local char_idx=$((RANDOM % chars_len))
+                local char="${chars:$char_idx:1}"
+                
+                buffer_move "$y" "$drop_col"
+                
+                if ((j == 0)); then
+                    # Head of drop - bright white
+                    buffer_print "\033[1;97m${char}"
+                elif ((j == 1)); then
+                    # Just behind head - very bright green
+                    buffer_print "\033[1;92m${char}"
+                elif ((j < 4)); then
+                    # Near head - bright green
+                    buffer_print "\033[1;32m${char}"
+                elif ((j < 8)); then
+                    # Middle - normal green
+                    buffer_print "\033[0;32m${char}"
+                else
+                    # Tail - dim green
+                    buffer_print "\033[2;32m${char}"
+                fi
+            fi
+        done
+        
+        drop_col=$((drop_col + 2))
+        ((drop_col > TERM_COLS)) && break
+    done
+    
+    # Display message if set
+    if [[ -n "$CONFIG_MESSAGE" ]]; then
+        local msg_len=${#CONFIG_MESSAGE}
+        local msg_col=$(( (TERM_COLS - msg_len) / 2 ))
+        local msg_row=$(( TERM_LINES / 2 ))
+        ((msg_col < 1)) && msg_col=1
+        
+        # Draw message with black background for visibility
+        buffer_move "$msg_row" "$msg_col"
+        buffer_print "\033[1;97;40m ${CONFIG_MESSAGE} \033[0m"
+    fi
+    
+    buffer_print "\033[0m"
+    end_frame
+}
+
+# ==============================================================================
+# Animation Controller
+# ==============================================================================
+
+# Signal handler for clean exit
+cleanup() {
+    RUNNING=false
+    exit_alt_buffer
+}
+
+# Main animation loop
+run_animation() {
+    local mode="${1:-$CONFIG_MODE}"
+    local duration="${2:-$CONFIG_DURATION_SECONDS}"
+    
+    # Set up signal handlers
+    trap cleanup EXIT INT TERM HUP
+    
+    # Get initial terminal size
+    update_term_size
+    
+    # Enter alternate buffer
+    enter_alt_buffer
+    flush_input
+    
+    # Initialize animation
+    case "$mode" in
+        stars)  init_stars ;;
+        bounce) init_bounce ;;
+        matrix) init_matrix ;;
+    esac
+    
+    local frame=0
+    local start_time=$SECONDS
+    local frame_delay
+    frame_delay=$(awk "BEGIN {printf \"%.4f\", 1 / $CONFIG_FPS}")
+    
+    RUNNING=true
+    
+    # Give terminal time to settle after mode switch
+    sleep 0.1
+    flush_input
+    
+    while [[ "$RUNNING" == true ]]; do
+        # Check for keypress
+        local key_result=""
+        if read -r -s -t 0.001 -n 1 key_result 2>/dev/null && [[ -n "$key_result" ]]; then
+            break
+        fi
+        
+        # Check duration
+        if ((duration > 0)) && ((SECONDS - start_time >= duration)); then
+            break
+        fi
+        
+        # Update terminal size (in case of resize)
+        update_term_size
+        
+        # Render current frame
+        case "$mode" in
+            stars)  render_stars "$frame" ;;
+            bounce) render_bounce "$frame" ;;
+            matrix) render_matrix "$frame" ;;
+        esac
+        
+        ((frame++)) || true
+        
+        # Frame rate limiting
+        sleep "$frame_delay" 2>/dev/null || sleep 0.066
+    done
+    
+    exit_alt_buffer
+}
+
+# ==============================================================================
+# Idle Watcher
+# ==============================================================================
+
+# Get idle time in seconds (Linux)
+get_idle_time() {
+    local idle=0
+    
+    # Try to read from /proc for X11 idle time
+    if command -v xprintidle &>/dev/null; then
+        idle=$(($(xprintidle) / 1000))
+    # Try to use w command to get terminal idle
+    elif command -v w &>/dev/null; then
+        # Get idle time for current terminal
+        local tty
+        tty=$(tty 2>/dev/null | sed 's|/dev/||')
+        if [[ -n "$tty" ]]; then
+            local idle_str
+            idle_str=$(w -h 2>/dev/null | awk -v tty="$tty" '$2 == tty {print $4}')
+            if [[ -n "$idle_str" ]]; then
+                # Parse idle time (formats: 0.00s, 1:23, 1:23m, etc.)
+                if [[ "$idle_str" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                    idle=$((${BASH_REMATCH[1]} * 60 + ${BASH_REMATCH[2]}))
+                elif [[ "$idle_str" =~ ^([0-9]+)\.([0-9]+)s$ ]]; then
+                    idle=${BASH_REMATCH[1]}
+                elif [[ "$idle_str" =~ ^([0-9]+)s$ ]]; then
+                    idle=${BASH_REMATCH[1]}
+                fi
+            fi
+        fi
+    fi
+    
+    echo "$idle"
+}
+
+# Watch for idle and launch animation
+watch_idle() {
+    local idle_threshold="${1:-$CONFIG_IDLE_SECONDS}"
+    
+    info "Watching for idle time (threshold: ${idle_threshold}s)"
+    info "Press Ctrl+C to stop watching"
+    
+    # Set up signal handler
+    trap 'echo; info "Stopped watching"; exit 0' INT TERM
+    
+    local last_check_idle=0
+    
+    while true; do
+        local current_idle
+        current_idle=$(get_idle_time)
+        
+        if ((current_idle >= idle_threshold)); then
+            # Only trigger if we haven't just returned from animation
+            if ((last_check_idle < idle_threshold)); then
+                info "Idle detected (${current_idle}s >= ${idle_threshold}s), launching animation..."
+                run_animation "$CONFIG_MODE" "$CONFIG_DURATION_SECONDS"
+                info "Animation ended, resuming watch..."
+            fi
+        fi
+        
+        last_check_idle=$current_idle
+        sleep 1
+    done
+}
+
+# ==============================================================================
+# CLI Commands
+# ==============================================================================
+
+cmd_run() {
+    local mode=""
+    local config_path="$DEFAULT_CONFIG_PATH"
+    local duration=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode|-m)
+                mode="$2"
+                shift 2
+                ;;
+            --config|-c)
+                config_path="$2"
+                shift 2
+                ;;
+            --duration|-d)
+                duration="$2"
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: $PROGRAM_NAME run [OPTIONS]"
+                echo ""
+                echo "Run the screensaver animation immediately"
+                echo ""
+                echo "Options:"
+                echo "  -m, --mode MODE      Animation mode (stars, bounce, matrix)"
+                echo "  -c, --config PATH    Config file path"
+                echo "  -d, --duration SECS  Duration in seconds (0 = infinite)"
+                echo "  -h, --help           Show this help"
+                return 0
+                ;;
+            *)
+                err "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+    
+    check_interactive
+    
+    # Load and validate config
+    parse_config "$config_path"
+    
+    # Override with CLI options
+    [[ -n "$mode" ]] && CONFIG_MODE="$mode"
+    [[ -n "$duration" ]] && CONFIG_DURATION_SECONDS="$duration"
+    
+    if ! validate_config; then
+        return 1
+    fi
+    
+    run_animation "$CONFIG_MODE" "$CONFIG_DURATION_SECONDS"
+}
+
+cmd_watch() {
+    local idle=""
+    local config_path="$DEFAULT_CONFIG_PATH"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --idle|-i)
+                idle="$2"
+                shift 2
+                ;;
+            --config|-c)
+                config_path="$2"
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: $PROGRAM_NAME watch [OPTIONS]"
+                echo ""
+                echo "Watch for idle time and launch animation automatically"
+                echo ""
+                echo "Options:"
+                echo "  -i, --idle SECS      Idle threshold in seconds"
+                echo "  -c, --config PATH    Config file path"
+                echo "  -h, --help           Show this help"
+                return 0
+                ;;
+            *)
+                err "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+    
+    check_interactive
+    
+    # Load and validate config
+    parse_config "$config_path"
+    
+    # Override with CLI options
+    [[ -n "$idle" ]] && CONFIG_IDLE_SECONDS="$idle"
+    
+    if ! validate_config; then
+        return 1
+    fi
+    
+    watch_idle "$CONFIG_IDLE_SECONDS"
+}
+
+cmd_list_modes() {
+    echo "Available animation modes:"
+    echo ""
+    for mode in "${AVAILABLE_MODES[@]}"; do
+        case "$mode" in
+            stars)  echo "  stars   - Scrolling starfield with twinkling effect" ;;
+            bounce) echo "  bounce  - Bouncing text/logo (DVD screensaver style)" ;;
+            matrix) echo "  matrix  - Matrix-style falling characters" ;;
+        esac
+    done
+}
+
+cmd_validate_config() {
+    local config_path="$DEFAULT_CONFIG_PATH"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config|-c)
+                config_path="$2"
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: $PROGRAM_NAME validate-config [OPTIONS]"
+                echo ""
+                echo "Validate configuration file"
+                echo ""
+                echo "Options:"
+                echo "  -c, --config PATH    Config file path (default: $DEFAULT_CONFIG_PATH)"
+                echo "  -h, --help           Show this help"
+                return 0
+                ;;
+            *)
+                err "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+    
+    if [[ ! -f "$config_path" ]]; then
+        warn "Config file not found: $config_path"
+        echo "Using default configuration"
+    else
+        info "Validating config: $config_path"
+        parse_config "$config_path"
+    fi
+    
+    if validate_config; then
+        echo ""
+        info "Configuration is valid!"
+        echo ""
+        show_config
+        return 0
+    else
+        return 1
+    fi
+}
+
+cmd_version() {
+    echo "$PROGRAM_NAME version $VERSION"
+}
+
+cmd_help() {
+    cat << EOF
+$PROGRAM_NAME — Terminal idle animation / screensaver
+
+Usage: $PROGRAM_NAME <command> [options]
+
+Commands:
+  run              Launch animation immediately
+  watch            Watch for idle time and auto-launch
+  list-modes       List available animation modes
+  validate-config  Validate configuration file
+  version          Show version
+  help             Show this help message
+
+Examples:
+  $PROGRAM_NAME run
+  $PROGRAM_NAME run --mode matrix --duration 30
+  $PROGRAM_NAME watch --idle 60
+  $PROGRAM_NAME validate-config --config ~/.config/termwall/config
+
+Config file: $DEFAULT_CONFIG_PATH
+
+For more information, see: https://github.com/your-username/termwall
+EOF
+}
+
+# ==============================================================================
+# Main Entry Point
+# ==============================================================================
+
+main() {
+    local command="${1:-}"
+    shift || true
+    
+    case "$command" in
+        run)
+            cmd_run "$@"
+            ;;
+        watch)
+            cmd_watch "$@"
+            ;;
+        list-modes)
+            cmd_list_modes
+            ;;
+        validate-config)
+            cmd_validate_config "$@"
+            ;;
+        version|--version|-v)
+            cmd_version
+            ;;
+        help|--help|-h|"")
+            cmd_help
+            ;;
+        *)
+            err "Unknown command: $command"
+            echo "Run '$PROGRAM_NAME help' for usage information"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

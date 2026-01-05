@@ -1,0 +1,16 @@
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.cast
+*.rec
+
+# Temporary files
+*.tmp
+*.bak

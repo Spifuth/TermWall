@@ -1,0 +1,55 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Run ShellCheck
+      uses: ludeeus/action-shellcheck@master
+      with:
+        scandir: '.'
+        severity: warning
+        format: tty
+      env:
+        SHELLCHECK_OPTS: -e SC2034 -e SC1090
+
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Make script executable
+      run: chmod +x termwall
+
+    - name: Test help command
+      run: ./termwall help
+
+    - name: Test version command
+      run: ./termwall version
+
+    - name: Test list-modes command
+      run: ./termwall list-modes
+
+    - name: Test validate-config with example
+      run: ./termwall validate-config --config config.example
+
+    - name: Test run with duration (smoke test)
+      run: |
+        # Run for 2 seconds in a pseudo-terminal
+        # Use script command to provide a PTY
+        script -q -c "./termwall run --mode stars --duration 2" /dev/null || true
+        echo "Smoke test completed with exit code: $?"

@@ -1,0 +1,51 @@
+# termwall configuration file
+# Copy this file to ~/.config/termwall/config
+#
+# All values are optional - defaults will be used if not specified
+
+# ==============================================================================
+# Animation Settings
+# ==============================================================================
+
+# Animation mode: stars, bounce, matrix
+mode = stars
+
+# Frames per second (1-60)
+# Higher = smoother but more CPU usage
+fps = 60
+
+# Color theme: green, cyan, magenta, mono
+color_theme = green
+
+# Custom message to display (optional)
+# Leave empty or comment out for no message
+# message = "Hello, World!"
+message =
+
+# ==============================================================================
+# Timing Settings
+# ==============================================================================
+
+# Seconds of inactivity before screensaver activates (for watch mode)
+idle_seconds = 300
+
+# Duration of animation in seconds (0 = infinite, until keypress)
+duration_seconds = 0
+
+# ==============================================================================
+# Examples
+# ==============================================================================
+#
+# Matrix-style with cyan theme:
+#   mode = matrix
+#   color_theme = cyan
+#   fps = 20
+#
+# Bouncing text:
+#   mode = bounce
+#   message = "BE RIGHT BACK"
+#   color_theme = magenta
+#
+# Quick screensaver (5 min idle, 30 sec display):
+#   idle_seconds = 300
+#   duration_seconds = 30
