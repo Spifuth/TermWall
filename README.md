@@ -2,7 +2,7 @@
 
 > Terminal idle animation / screensaver in pure Bash
 
-[![ShellCheck](https://github.com/your-username/termwall/workflows/ShellCheck/badge.svg)](https://github.com/your-username/termwall/actions)
+[![ShellCheck](https://github.com/Spifuth/TermWall/workflows/ShellCheck/badge.svg)](https://github.com/Spifuth/TermWall/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **termwall** is a screensaver for your terminal. After a period of inactivity, it takes over the screen with a beautiful full-screen animation. Press any key to instantly return to your terminal, exactly as you left it.
@@ -32,7 +32,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/termwall.git
+git clone https://github.com/Spifuth/TermWall.git
 cd termwall
 
 # Make executable and install
