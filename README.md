@@ -7,7 +7,6 @@
 
 **termwall** is a screensaver for your terminal. After a period of inactivity, it takes over the screen with a beautiful full-screen animation. Press any key to instantly return to your terminal, exactly as you left it.
 
-![termwall demo](docs/demo.gif)
 
 ## ✨ Features
 
